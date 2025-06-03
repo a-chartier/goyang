@@ -113,10 +113,11 @@ type Entry struct {
 	// is a module only.
 	Identities []*Identity `json:",omitempty"`
 
-	Augments   []*Entry                   `json:",omitempty"` // Augments defined in this entry.
-	Augmented  []*Entry                   `json:",omitempty"` // Augments merged into this entry.
-	Deviations []*DeviatedEntry           `json:"-"`          // Deviations associated with this entry.
-	Deviate    map[deviationType][]*Entry `json:"-"`
+	Augments    []*Entry                   `json:",omitempty"` // Augments defined in this entry.
+	Augmented   []*Entry                   `json:",omitempty"` // Augments merged into this entry.
+	AugmentedBy []*Entry                   `json:",omitempty"` // Augmented By merged into this entry.
+	Deviations  []*DeviatedEntry           `json:"-"`          // Deviations associated with this entry.
+	Deviate     map[deviationType][]*Entry `json:"-"`
 	// deviationPresence tracks whether certain attributes for a DeviateEntry-type
 	// Entry have been given deviation values.
 	deviatePresence deviationPresence
@@ -660,6 +661,23 @@ func ToEntry(n Node) (e *Entry) {
 		// when the group is used in multiple locations and the
 		// grouping has a leafref that references outside the group.
 		e = ToEntry(g).dup()
+
+		switch determineYangVersion(g) {
+		case YANGVersion10:
+			if len(s.Augment) > 1 {
+				return newError(s, "multiple augments not allowed in yang version 1.0: %s", s.Name)
+			}
+		}
+
+		// process augments
+		for _, x := range s.Augment {
+			a := ToEntry(x)
+			a.Parent = e
+			a.Augments = append(a.Augments, e)
+			a.AugmentedBy = append(a.AugmentedBy, e)
+			e.Find(a.Name).merge(nil, a.Namespace(), a)
+		}
+
 		addExtraKeywordsToLeafEntry(n, e)
 		return e
 	}
@@ -740,6 +758,7 @@ func ToEntry(n Node) (e *Entry) {
 				ne := ToEntry(a)
 				ne.Parent = e
 				e.Augments = append(e.Augments, ne)
+				e.AugmentedBy = append(e.AugmentedBy, ne)
 			}
 		case "anydata":
 			for _, a := range fv.Interface().([]*AnyData) {
@@ -1045,6 +1064,33 @@ func ToEntry(n Node) (e *Entry) {
 	return e
 }
 
+// YANGVersion is the enum that represents the YANG Version.
+type YANGVersion string
+
+const (
+	YANGVersion10 YANGVersion = "1.0"
+	YANGVersion11 YANGVersion = "1.1"
+)
+
+func determineYangVersion(n Node) YANGVersion {
+	p := n.ParentNode()
+	if p != nil {
+		return determineYangVersion(p)
+	}
+	var m *Module
+	var ok bool
+	if m, ok = n.(*Module); ok {
+		switch m.YangVersion.asString() {
+		case string(YANGVersion10):
+			return YANGVersion10
+		case string(YANGVersion11):
+			return YANGVersion11
+		}
+	}
+	// default to 1.0
+	return YANGVersion10
+}
+
 // addExtraKeywordsToLeafEntry stores the values for unimplemented keywords in leaf entries.
 func addExtraKeywordsToLeafEntry(n Node, e *Entry) {
 	v := reflect.ValueOf(n).Elem()
@@ -1119,6 +1165,7 @@ func (e *Entry) Augment(addErrors bool) (processed, skipped int) {
 		processed++
 		target.merge(nil, a.Namespace(), a)
 		target.Augmented = append(target.Augmented, a.shallowDup())
+		target.AugmentedBy = append(target.AugmentedBy, a)
 	}
 	e.Augments = unapplied
 	return processed, skipped
@@ -1651,4 +1698,41 @@ func (e *Entry) DefaultValues() []string {
 		}
 	}
 	return nil
+}
+
+// getOrderedChildren lists a nodes child fields and recursively expands
+// imported groups in depth first order.
+func getOrderedChildren(e Node, seen map[string]bool) []string {
+	res := []string{}
+	for _, stmt := range e.Statement().SubStatements() {
+		// If it is a uses statement, and we can resolve the group recurse into it
+		if stmt.Kind() == (&Uses{}).Kind() {
+			if grp := FindGrouping(e, stmt.NName(), seen); grp != nil {
+				res = append(res, getOrderedChildren(grp, seen)...)
+				continue
+			}
+		}
+
+		res = append(res, stmt.NName())
+	}
+	return res
+}
+
+// GetOrderedChildren returns the order of child elements in this entry from
+// the original yang module. Fields from augments may not be retured in
+// deterministed order, but will always be last.
+func (e *Entry) GetOrderedChildren() []string {
+	seen := map[string]bool{}
+	return getOrderedChildren(e.Node, seen)
+}
+
+// GetOrderedAugments returns the order of augments on an entry.
+// TODO: is the order of these actually deterministic? Would depend on import order.
+func (e *Entry) GetOrderedAugments() []string {
+	seen := map[string]bool{}
+	res := []string{}
+	for _, aug := range e.AugmentedBy {
+		res = append(res, getOrderedChildren(aug.Node, seen)...)
+	}
+	return res
 }
